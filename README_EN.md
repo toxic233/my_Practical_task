@@ -39,7 +39,7 @@ Heterogeneous Graph Neural Networks (HGNNs) excel at processing complex network 
 ## 🏗️ Technical Architecture
 
 ### System Architecture
-[Figure 4 Research Process Model](image/图片6.png)
+![Figure 4 Research Process Model](image/图片6.png)
 
 ### Core Modules
 
@@ -75,15 +75,15 @@ Goal: Address size and distribution differences
 ### Experimental Setup
 - **Bibliographic Data Heterogeneous Network Example**:
   
-  [Figure 1 Bibliographic Data Heterogeneous Network](image/图片1.png)[Figure 1 Bibliographic Data Heterogeneous Network](image/图片2.png)
+  ![Figure 1 Bibliographic Data Heterogeneous Network](image/图片1.png)![Figure 1 Bibliographic Data Heterogeneous Network](image/图片2.png)
 
 - **Counterfactual Reasoning Application Scenarios**:
   
-  [Figure 2 Main Research Areas of Counterfactual Reasoning](image/图片3.png)
+  ![Figure 2 Main Research Areas of Counterfactual Reasoning](image/图片3.png)
 
 - **Perturbation Operation Examples**:
   
-  [(a) Node Perturbation Example](image/图片4.png)[(b) Edge Perturbation Example](image/图片5.png)
+ ![(a) Node Perturbation Example](image/图片4.png)![(b) Edge Perturbation Example](image/图片5.png)
 
 ### Evaluation Metrics
 - **Fidelity**: Importance degree of explanatory subgraphs for target node predictions
