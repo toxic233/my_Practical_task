@@ -75,7 +75,7 @@
 ### 实验设置
 - **文献数据异质网络示例**:
   
-  [图1 文献数据异质网络](https://github.com/toxic233/my_Practical_task/blob/main/image/图片1.png)[图1 文献数据异质网络](image/图片2.png)
+  [图1 文献数据异质网络](image/图片1.png)[图1 文献数据异质网络](image/图片2.png)
 
 - **反事实推理应用场景**:
   
