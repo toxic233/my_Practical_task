@@ -39,7 +39,7 @@
 ## 🏗️ 技术架构
 
 ### 系统架构图
-[图4 研究流程模型图](https://github.com/toxic233/my_Practical_task/blob/main/image/图片6.png)
+![图4 研究流程模型图](https://github.com/toxic233/my_Practical_task/blob/main/image/图片6.png)
 
 ### 核心模块
 
