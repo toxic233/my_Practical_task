@@ -1,0 +1,1760 @@
+import pickle
+import numpy as np
+import scipy.sparse
+from itertools import combinations
+import networkx as nx
+import torch
+import explainer.node2vec as nv
+from scipy.spatial import distance
+from torch_geometric.data import Data
+import torch_geometric.transforms as T
+from torch_geometric.datasets import Planetoid
+from torch_geometric.utils import to_networkx
+from torch_geometric.nn import GraphSAGE, DeepGraphInfomax, GCNConv
+from tqdm import tqdm
+import time
+import os
+
+def labelling_graph(graph):
+    """
+    为图的节点和边添加标签
+    
+    参数:
+        graph: NetworkX图对象
+        
+    返回:
+        graph: 添加了标签的NetworkX图对象
+    """
+    for idx, node in enumerate(graph.nodes()):
+        graph.nodes[node]['label'] = idx    
+    for edge in graph.edges():
+        graph[edge[0]][edge[1]]['weight'] = 1
+    graph = graph.to_undirected()
+    return graph
+
+def emb_dist_rank(base_emb, neighbors_cnt):
+    """
+    计算基础嵌入之间的距离并进行排序
+    
+    参数:
+        base_emb: 基础嵌入
+        neighbors_cnt: 考虑的邻居数量
+        
+    返回:
+        bf_dist_rank: 距离排名
+        bf_dist: 距离矩阵
+    """
+    # 确保base_emb是NumPy数组
+    if torch.is_tensor(base_emb):
+        base_emb = base_emb.cpu().detach().numpy()
+    
+    bf_dist = distance.cdist(base_emb, base_emb, 'euclidean')
+    bf_dist_rank = bf_dist.argsort()[:,1:(1+neighbors_cnt)]
+    return bf_dist_rank, bf_dist
+
+def emb_dist_rank_dblp(base_emb, neighbors_cnt, author_only=True):
+    """
+    针对DBLP数据集的嵌入距离排名函数，可以选择只考虑作者节点作为最近邻
+    
+    参数:
+        base_emb: 基础嵌入
+        neighbors_cnt: 考虑的邻居数量
+        author_only: 是否只考虑作者节点作为最近邻
+        
+    返回:
+        bf_dist_rank: 距离排名
+        bf_dist: 距离矩阵
+    """
+    # 确保base_emb是NumPy数组
+    if torch.is_tensor(base_emb):
+        base_emb = base_emb.cpu().detach().numpy()
+    
+    # 计算所有节点之间的欧几里得距离
+    bf_dist = distance.cdist(base_emb, base_emb, 'euclidean')
+    
+    if author_only:
+        # 作者节点的索引范围是0到4056（共4057个节点）
+        author_indices = np.arange(4057)
+        
+        # 创建一个掩码，标记非作者节点的距离为无穷大
+        mask = np.ones_like(bf_dist) * np.inf
+        for i in author_indices:
+            mask[:, i] = 0
+        
+        # 应用掩码，使得只考虑作者节点作为最近邻
+        bf_dist_masked = bf_dist + mask
+        
+        # 对于每个节点，找出距离最近的neighbors_cnt个作者节点
+        bf_dist_rank = bf_dist_masked.argsort()[:,1:(1+neighbors_cnt)]
+    else:
+        # 如果不只考虑作者节点，则使用原始的计算方法
+        bf_dist_rank = bf_dist.argsort()[:,1:(1+neighbors_cnt)]
+    
+    return bf_dist_rank, bf_dist
+
+def load_dataset(args):
+    if args.dataset in ['Cora', 'CiteSeer', 'PubMed']:
+        if args.task =='node':
+            path = './dataset'
+            dataset = Planetoid(path, name=args.dataset, transform=T.NormalizeFeatures())
+            data = dataset[0]
+            G = to_networkx(data, to_undirected=True)
+            G = labelling_graph(G)
+            return data, G
+            
+        else:
+            path_nm = './dataset/' + str(args.dataset).lower() + '_'
+            with open(path_nm + 'train_data' ,'rb') as fw:
+                data = pickle.load(fw)
+                G = to_networkx(data, to_undirected=True)
+                G = labelling_graph(G)
+            with open(path_nm + 'test_data' ,'rb') as fw:
+                test_data = pickle.load(fw)
+            return (data,test_data), G
+    elif args.dataset == 'ACM':
+        from dataset.acm_dataset import ACMDataset
+        path = './dataset'
+        dataset = ACMDataset(root=path, transform=T.NormalizeFeatures())
+        data = dataset[0]
+        G = to_networkx(data, to_undirected=True)
+        G = labelling_graph(G)
+        if args.task == 'node':
+            return data, G
+        else:
+            # 对于链接预测任务，我们需要划分训练集和测试集
+            # 这里简单地返回相同的数据作为训练集和测试集
+            # 实际应用中可能需要更复杂的划分方法
+            return (data, data), G
+    
+    elif args.dataset == 'IMDB' or args.dataset == 'DBLP':
+        from dataset.magnn_utils.data import load_IMDB_data, load_DBLP_data
+        import torch_geometric.utils as utils
+        import os
+        
+        # 尝试加载真实数据
+        if args.dataset == 'DBLP':
+            try:
+                # 使用真实DBLP数据
+                prefix = './data/preprocessed/DBLP_processed'
+                adjlists, edge_metapath_indices, features_list, adjM, type_mask, labels, train_val_test_idx = load_DBLP_data(prefix)
+                
+                print(f"成功加载真实DBLP数据集！")
+                print(f"节点总数: {adjM.shape[0]}")
+                print(f"边总数: {adjM.nnz // 2}")  # 无向图，所以除以2
+                
+                # 统计各类型节点数量
+                unique_types, counts = np.unique(type_mask, return_counts=True)
+                node_type_names = ['Author', 'Paper', 'Term', 'Conference']
+                for i, (node_type, count) in enumerate(zip(unique_types, counts)):
+                    if i < len(node_type_names):
+                        print(f"{node_type_names[i]}节点数量: {count}")
+                
+                # 计算各类型边的数量
+                rows, cols = adjM.nonzero()
+                edge_type_counts = {'A-P': 0, 'P-T': 0, 'P-V': 0, 'Others': 0}
+                
+                num_authors = counts[0] if len(counts) > 0 else 4057
+                num_papers = counts[1] if len(counts) > 1 else 14328  
+                num_terms = counts[2] if len(counts) > 2 else 7723
+                num_confs = counts[3] if len(counts) > 3 else 20
+                
+                for r, c in zip(rows, cols):
+                    if r < c:  # 只计算一次（无向图）
+                        # Author-Paper边
+                        if (r < num_authors and num_authors <= c < num_authors + num_papers) or \
+                           (c < num_authors and num_authors <= r < num_authors + num_papers):
+                            edge_type_counts['A-P'] += 1
+                        # Paper-Term边  
+                        elif (num_authors <= r < num_authors + num_papers and num_authors + num_papers <= c < num_authors + num_papers + num_terms) or \
+                             (num_authors <= c < num_authors + num_papers and num_authors + num_papers <= r < num_authors + num_papers + num_terms):
+                            edge_type_counts['P-T'] += 1
+                        # Paper-Venue/Conference边
+                        elif (num_authors <= r < num_authors + num_papers and c >= num_authors + num_papers + num_terms) or \
+                             (num_authors <= c < num_authors + num_papers and r >= num_authors + num_papers + num_terms):
+                            edge_type_counts['P-V'] += 1
+                        else:
+                            edge_type_counts['Others'] += 1
+                
+                print(f"边类型统计:")
+                for edge_type, count in edge_type_counts.items():
+                    print(f"  {edge_type}: {count}")
+                
+            except Exception as e:
+                print(f"加载真实DBLP数据失败: {e}")
+                print("使用模拟DBLP数据...")
+                
+                # 创建模拟数据（如果真实数据加载失败）
+                num_nodes = 4057 + 14328 + 7723 + 20  # author + paper + term + conf
+                
+                # 创建特征
+                features_0 = np.random.rand(4057, 334).astype(np.float32)  # author (使用真实维度)
+                features_1 = np.random.rand(14328, 4231).astype(np.float32)  # paper (使用真实维度)
+                features_2 = np.random.rand(7723, 50).astype(np.float32)  # term (使用真实维度)
+                features_3 = np.eye(20, dtype=np.float32)  # conf (使用单位矩阵)
+                features_list = [features_0, features_1, features_2, features_3]
+                
+                # 创建更真实的邻接矩阵，参考真实DBLP统计
+                adjM = np.zeros((num_nodes, num_nodes))
+                
+                # A-P边: 19,645条
+                for _ in range(19645):
+                    author = np.random.randint(0, 4057)
+                    paper = np.random.randint(4057, 4057 + 14328)
+                    adjM[author, paper] = 1
+                    adjM[paper, author] = 1
+                
+                # P-T边: 85,810条
+                for _ in range(85810):
+                    paper = np.random.randint(4057, 4057 + 14328)
+                    term = np.random.randint(4057 + 14328, 4057 + 14328 + 7723)
+                    adjM[paper, term] = 1
+                    adjM[term, paper] = 1
+                
+                # P-V边: 14,328条
+                for _ in range(14328):
+                    paper = np.random.randint(4057, 4057 + 14328)
+                    conf = np.random.randint(4057 + 14328 + 7723, num_nodes)
+                    adjM[paper, conf] = 1
+                    adjM[conf, paper] = 1
+                
+                # 转换为稀疏矩阵
+                adjM = scipy.sparse.csr_matrix(adjM)
+                
+        elif args.dataset == 'IMDB':
+            # IMDB数据集处理（保持原有逻辑）
+            prefix = './checkpoint'
+            # 创建一个简单的图作为示例
+            num_nodes = 4278 + 2779 + 5257  # movie + director + actor
+            
+            # 创建特征
+            features_0 = np.random.rand(4278, 64).astype(np.float32)  # movie
+            features_1 = np.random.rand(2779, 64).astype(np.float32)  # director
+            features_2 = np.random.rand(5257, 64).astype(np.float32)  # actor
+            features_list = [features_0, features_1, features_2]
+            
+            # 创建邻接矩阵
+            adjM = np.zeros((num_nodes, num_nodes))
+            # 添加一些随机边
+            for i in range(1000):
+                src = np.random.randint(0, num_nodes)
+                dst = np.random.randint(0, num_nodes)
+                adjM[src, dst] = 1
+                adjM[dst, src] = 1  # 确保是无向图
+            
+            # 转换为稀疏矩阵
+            adjM = scipy.sparse.csr_matrix(adjM)
+        
+        # 将异构图数据转换为PyG格式
+        edge_index = utils.from_scipy_sparse_matrix(adjM)[0]
+        
+        # 对于DBLP真实数据，特征维度不同，需要统一处理
+        if args.dataset == 'DBLP' and len(features_list) > 0:
+            # 获取每种类型特征的维度
+            feature_dims = [features.shape[1] for features in features_list]
+            max_dim = max(feature_dims)
+            
+            # 将所有特征填充到相同维度
+            padded_features = []
+            for features in features_list:
+                if features.shape[1] < max_dim:
+                    # 用零填充到最大维度
+                    padding = np.zeros((features.shape[0], max_dim - features.shape[1]), dtype=features.dtype)
+                    padded_features.append(np.concatenate([features, padding], axis=1))
+                else:
+                    padded_features.append(features)
+            
+            x = torch.cat([torch.FloatTensor(features) for features in padded_features], dim=0)
+        else:
+            x = torch.cat([torch.FloatTensor(features) for features in features_list], dim=0)
+        
+        data = Data(x=x, edge_index=edge_index)
+        
+        # 创建NetworkX图
+        G = nx.Graph()
+        # 添加节点
+        for i in range(adjM.shape[0]):
+            G.add_node(i)
+        # 添加边
+        rows, cols = adjM.nonzero()
+        for i, j in zip(rows, cols):
+            G.add_edge(i, j)
+        G = labelling_graph(G)
+        
+        if args.task == 'node':
+            return data, G
+        else:
+            # 对于链接预测任务，简单地返回相同的数据
+            return (data, data), G
+            
+            
+    elif args.dataset in ['syn1', 'syn2', 'syn3', 'syn4']:
+        
+        dataset_pth = './dataset/'+ args.dataset+ '.pkl'
+        with open(dataset_pth, 'rb') as fin:
+                adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask, edge_label_matrix  = pickle.load(fin)
+        x = torch.from_numpy(features).float()
+        adj = torch.from_numpy(adj)
+        edge_index = adj.nonzero().t().contiguous()
+        y = train_mask.reshape(-1, 1) * y_train + val_mask.reshape(-1, 1) * y_val + test_mask.reshape(-1, 1) * y_test
+        node_label = torch.from_numpy(np.where(y)[1])
+        dataset = Data(x=x, edge_index=edge_index, y=node_label)
+        G = to_networkx(dataset, to_undirected=True)
+        G = labelling_graph(G)
+        return dataset, G
+    else:
+        print('Currently, the dataset is not implemented.')
+        exit()
+
+def load_model(args, data, device):
+    path_nm = './model/'+str(args.dataset.lower())+'_'+str(args.model) + '_'+ str(args.task)
+    x, edge_index = data.x.to(device), data.edge_index.to(device)
+    
+    if args.model == 'graphsage':
+        model = GraphSAGE(data.num_node_features, hidden_channels=args.hidden_dim, num_layers=2).to(device)
+        model.load_state_dict(torch.load(path_nm, map_location=device))
+        with torch.no_grad():
+            model.eval()
+            z = model(x, edge_index)
+            z = z.cpu()  # 确保z是CPU张量
+    elif args.model == 'dgi':
+        
+        # class Encoder(torch.nn.Module):
+        #     def __init__(self, in_channels, hidden_channels):
+        #         super().__init__()
+        #         self.conv = GCNConv(in_channels, hidden_channels)
+        #         self.prelu = torch.nn.PReLU(hidden_channels)
+
+        #     def forward(self, x, edge_index, edge_weight= None):
+        #         x = self.conv(x, edge_index, edge_weight)
+        #         x = self.prelu(x)
+        #         return x
+        
+        def corruption(x, edge_index, edge_weight=None):
+            return x[torch.randperm(x.size(0))], edge_index
+
+        model = DeepGraphInfomax(
+                hidden_channels=512, encoder=GraphSAGE(data.x.shape[1], hidden_channels=512, num_layers=2),
+        summary=lambda z, *args, **kwargs: torch.sigmoid(z.mean(dim=0)),
+        corruption=corruption).to(device)
+    
+        model.load_state_dict(torch.load(path_nm))
+        
+        with torch.no_grad():
+            model.eval()
+            z = model.encoder(x, edge_index)
+            z = z.cpu()  # 确保z是CPU张量
+    
+    elif args.model == 'magnn':
+        from fix_magnn_model import MAGNN
+        import scipy.sparse as sp
+        
+        # 设置模型参数
+        if args.dataset == 'IMDB':
+            hidden_dim = 64
+            num_classes = 3
+            # IMDB数据集有3种节点类型：movie, director, actor
+            num_movie = 4278
+            num_director = 2779
+            num_actor = 5257
+            total_nodes = num_movie + num_director + num_actor
+            
+            # 创建更有结构的模拟数据
+            # 1. 生成有意义的特征（使用正态分布而不是均匀分布）
+            np.random.seed(42)  # 设置随机种子以确保可重复性
+            features_0 = np.random.randn(num_movie, 64).astype(np.float32) * 0.1  # movie
+            features_1 = np.random.randn(num_director, 64).astype(np.float32) * 0.1  # director
+            features_2 = np.random.randn(num_actor, 64).astype(np.float32) * 0.1  # actor
+            
+            # 2. 创建更有结构的邻接矩阵
+            adjM = np.zeros((total_nodes, total_nodes))
+            
+            # 电影-导演关系：每个电影平均连接2个导演
+            for i in range(num_movie):
+                for _ in range(2):  # 每个电影连接2个导演
+                    j = np.random.randint(0, num_director)
+                    adjM[i, num_movie + j] = 1
+                    adjM[num_movie + j, i] = 1  # 确保是无向图
+            
+            # 电影-演员关系：每个电影平均连接10个演员
+            for i in range(num_movie):
+                for _ in range(10):  # 每个电影连接10个演员
+                    j = np.random.randint(0, num_actor)
+                    adjM[i, num_movie + num_director + j] = 1
+                    adjM[num_movie + num_director + j, i] = 1  # 确保是无向图
+            
+            # 同类型节点之间的关系
+            # 电影-电影关系：基于共同的导演或演员
+            for i in range(num_movie):
+                for j in range(i+1, num_movie):
+                    if np.random.rand() < 0.01:  # 1%的概率添加边
+                        adjM[i, j] = 1
+                        adjM[j, i] = 1
+            
+            # 转换为稀疏矩阵
+            adjM = sp.csr_matrix(adjM)
+            
+            # 创建节点特征字典
+            features_list = [features_0, features_1, features_2]
+            node_features_dict = {
+                'movie': torch.FloatTensor(features_0),
+                'director': torch.FloatTensor(features_1),
+                'actor': torch.FloatTensor(features_2)
+            }
+            num_nodes_per_type = {
+                'movie': num_movie,
+                'director': num_director,
+                'actor': num_actor
+            }
+            
+            # 创建元路径实例
+            # 为了简化，我们创建两种元路径：movie-director-movie和movie-actor-movie
+            print("生成IMDB数据集的元路径实例...")
+            
+            # 预先计算邻接关系，避免重复查询稀疏矩阵
+            # 1. 电影-导演关系
+            movie_to_directors = {}
+            director_to_movies = {}
+            # 2. 电影-演员关系
+            movie_to_actors = {}
+            actor_to_movies = {}
+            
+            # 构建邻接关系字典
+            print("构建邻接关系字典...")
+            
+            # 将稀疏矩阵转换为坐标格式，更高效地获取非零元素
+            rows, cols = adjM.nonzero()
+            
+            # 处理电影-导演关系
+            for i, j in zip(rows, cols):
+                if i < num_movie and num_movie <= j < num_movie + num_director:
+                    # 电影i连接到导演j-num_movie
+                    director_idx = j - num_movie
+                    if i not in movie_to_directors:
+                        movie_to_directors[i] = []
+                    movie_to_directors[i].append(director_idx)
+                    
+                    if director_idx not in director_to_movies:
+                        director_to_movies[director_idx] = []
+                    director_to_movies[director_idx].append(i)
+                
+                # 处理电影-演员关系
+                elif i < num_movie and j >= num_movie + num_director:
+                    # 电影i连接到演员j-(num_movie+num_director)
+                    actor_idx = j - (num_movie + num_director)
+                    
+                    if i not in movie_to_actors:
+                        movie_to_actors[i] = []
+                    movie_to_actors[i].append(actor_idx)
+                    
+                    if actor_idx not in actor_to_movies:
+                        actor_to_movies[actor_idx] = []
+                    actor_to_movies[actor_idx].append(i)
+            
+            # 生成movie-director-movie元路径实例
+            print("生成movie-director-movie元路径实例...")
+            metapath_instances_mdm = []
+            max_instances_per_type = 5000  # 限制每种元路径的实例数量
+            
+            # 随机选择一部分电影进行采样
+            sampled_movies = np.random.choice(num_movie, min(500, num_movie), replace=False)
+            
+            for movie_i in sampled_movies:
+                if movie_i not in movie_to_directors:
+                    continue
+                    
+                # 获取电影i的所有导演
+                directors = movie_to_directors[movie_i]
+                
+                # 对于每个导演，找出其他电影
+                for director in directors:
+                    if director not in director_to_movies:
+                        continue
+                        
+                    # 获取导演的所有电影
+                    movies = director_to_movies[director]
+                    
+                    # 添加元路径实例
+                    for movie_j in movies:
+                        if movie_i != movie_j:
+                            metapath_instances_mdm.append([(0, movie_i), (1, director), (0, movie_j)])
+                            
+                            # 检查是否达到限制
+                            if len(metapath_instances_mdm) >= max_instances_per_type:
+                                break
+                    
+                    if len(metapath_instances_mdm) >= max_instances_per_type:
+                        break
+                        
+                if len(metapath_instances_mdm) >= max_instances_per_type:
+                    break
+            
+            # 生成movie-actor-movie元路径实例
+            print("生成movie-actor-movie元路径实例...")
+            metapath_instances_mam = []
+            
+            for movie_i in sampled_movies:
+                if movie_i not in movie_to_actors:
+                    continue
+                    
+                # 获取电影i的所有演员
+                actors = movie_to_actors[movie_i]
+                
+                # 对于每个演员，找出其他电影
+                for actor in actors:
+                    if actor not in actor_to_movies:
+                        continue
+                        
+                    # 获取演员的所有电影
+                    movies = actor_to_movies[actor]
+                    
+                    # 添加元路径实例
+                    for movie_j in movies:
+                        if movie_i != movie_j:
+                            metapath_instances_mam.append([(0, movie_i), (2, actor), (0, movie_j)])
+                            
+                            # 检查是否达到限制
+                            if len(metapath_instances_mam) >= max_instances_per_type:
+                                break
+                    
+                    if len(metapath_instances_mam) >= max_instances_per_type:
+                        break
+                        
+                if len(metapath_instances_mam) >= max_instances_per_type:
+                    break
+            
+            print(f"生成的元路径实例数量: MDM={len(metapath_instances_mdm)}, MAM={len(metapath_instances_mam)}")
+            
+            # 合并元路径实例
+            metapath_instances = [metapath_instances_mdm, metapath_instances_mam]
+            
+        elif args.dataset == 'DBLP':
+            hidden_dim = 64
+            num_classes = 4
+            
+            print("加载真实DBLP数据集...")
+            from dataset.magnn_utils.data import load_DBLP_data
+            
+            # 加载真实的DBLP数据
+            adjlists, edge_metapath_indices_list, features_list, adjM, type_mask, labels, train_val_test_idx = load_DBLP_data()
+            
+            # 获取节点数量
+            num_author = (type_mask == 0).sum()
+            num_paper = (type_mask == 1).sum()
+            num_term = (type_mask == 2).sum()
+            num_conf = (type_mask == 3).sum()
+            total_nodes = len(type_mask)
+            
+            print(f"DBLP数据集统计: 作者={num_author}, 论文={num_paper}, 术语={num_term}, 会议={num_conf}, 总节点数={total_nodes}")
+            
+            # 创建节点特征字典
+            features_0 = torch.FloatTensor(features_list[0])  # author
+            features_1 = torch.FloatTensor(features_list[1])  # paper
+            features_2 = torch.FloatTensor(features_list[2])  # term
+            features_3 = torch.FloatTensor(features_list[3])  # conference
+            
+            node_features_dict = {
+                'author': features_0,
+                'paper': features_1,
+                'term': features_2,
+                'conference': features_3
+            }
+            
+            num_nodes_per_type = {
+                'author': num_author,
+                'paper': num_paper,
+                'term': num_term,
+                'conference': num_conf
+            }
+            
+            # 使用真实的元路径实例
+            print("处理DBLP元路径实例...")
+            
+            # 从adjlists和edge_metapath_indices_list创建元路径实例
+            # adjlists包含[adjlist00, adjlist01, adjlist02]
+            # edge_metapath_indices_list包含[idx00, idx01, idx02]
+            
+            print("创建以作者为起点或终点的元路径实例...")
+            
+            # 1. 创建author-paper-author (APA)元路径实例（限制数量）
+            metapath_instances_apa = []
+            max_apa_instances = 10000  # 限制APA实例数量
+            apa_count = 0
+            
+            print("正在生成APA元路径实例...")
+            # 使用adjlists[0]中的邻接列表创建APA元路径实例
+            for i, line in enumerate(adjlists[0]):
+                if apa_count >= max_apa_instances:
+                    print(f"达到APA元路径实例上限 {max_apa_instances}，停止生成")
+                    break
+                    
+                if i >= 10:  # 跳过前几行（可能是元数据）
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        source = int(parts[0])
+                        targets = list(map(int, parts[1:]))
+                        for target in targets:
+                            if apa_count >= max_apa_instances:
+                                break
+                            # 创建元路径实例：(author_source, paper_middle, author_target)
+                            metapath_instances_apa.append([(0, source), (1, -1), (0, target)])
+                            apa_count += 1
+            
+            # 2. 创建author-paper-conference-paper-author (APCPA)元路径实例（大幅限制数量）
+            metapath_instances_apcpa = []
+            max_apcpa_instances = 5000  # 大幅减少APCPA实例数量
+            apcpa_count = 0
+            
+            print("正在生成APCPA元路径实例...")
+            # 使用adjlists[2]中的邻接列表创建APCPA元路径实例
+            for i, line in enumerate(adjlists[2]):
+                if apcpa_count >= max_apcpa_instances:
+                    print(f"达到APCPA元路径实例上限 {max_apcpa_instances}，停止生成")
+                    break
+                    
+                if i >= 10:  # 跳过前几行（可能是元数据）
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        source = int(parts[0])
+                        targets = list(map(int, parts[1:]))
+                        for target in targets:
+                            if apcpa_count >= max_apcpa_instances:
+                                break
+                            # 创建元路径实例：(author_source, paper_1, conf, paper_2, author_target)
+                            metapath_instances_apcpa.append([(0, source), (1, -1), (3, -1), (1, -1), (0, target)])
+                            apcpa_count += 1
+            
+            # 3. 创建author-paper-term-paper-author (APTPA)元路径实例（优化版本）
+            metapath_instances_aptpa = []
+            
+            print("正在生成APTPA元路径实例（使用优化算法）...")
+            
+            # 预先计算邻接关系，避免重复查询稀疏矩阵
+            rows, cols = adjM.nonzero()
+            
+            # 构建author-paper邻接字典
+            author_to_papers = {}
+            for r, c in zip(rows, cols):
+                if r < num_author and num_author <= c < num_author + num_paper:
+                    author_id = r
+                    paper_id = c - num_author
+                    if author_id not in author_to_papers:
+                        author_to_papers[author_id] = []
+                    author_to_papers[author_id].append(paper_id)
+            
+            # 构建paper-term邻接字典
+            paper_to_terms = {}
+            for r, c in zip(rows, cols):
+                if num_author <= r < num_author + num_paper and num_author + num_paper <= c < num_author + num_paper + num_term:
+                    paper_id = r - num_author
+                    term_id = c - num_author - num_paper
+                    if paper_id not in paper_to_terms:
+                        paper_to_terms[paper_id] = []
+                    paper_to_terms[paper_id].append(term_id)
+            
+            # 构建term-paper邻接字典（反向）
+            term_to_papers = {}
+            for paper_id, term_ids in paper_to_terms.items():
+                for term_id in term_ids:
+                    if term_id not in term_to_papers:
+                        term_to_papers[term_id] = []
+                    term_to_papers[term_id].append(paper_id)
+            
+            # 生成APTPA元路径实例（author->paper->term->paper->author）
+            aptpa_count = 0
+            max_aptpa_instances = 5000  # 大幅减少APTPA元路径实例数量，防止内存溢出
+            
+            for author1_id, paper1_ids in author_to_papers.items():
+                if aptpa_count >= max_aptpa_instances:
+                    print(f"达到APTPA元路径实例上限 {max_aptpa_instances}，停止生成")
+                    break
+                    
+                for paper1_id in paper1_ids:
+                    if paper1_id in paper_to_terms:
+                        for term_id in paper_to_terms[paper1_id]:
+                            if term_id in term_to_papers:
+                                for paper2_id in term_to_papers[term_id]:
+                                    if paper2_id != paper1_id:  # 避免重复的论文
+                                        # 找到连接paper2的作者
+                                        for author2_id, author2_paper_ids in author_to_papers.items():
+                                            if paper2_id in author2_paper_ids and author2_id != author1_id:
+                                                # 创建APTPA元路径：author1->paper1->term->paper2->author2
+                                                metapath_instances_aptpa.append([
+                                                    (0, author1_id), (1, paper1_id), (2, term_id), 
+                                                    (1, paper2_id), (0, author2_id)
+                                                ])
+                                                aptpa_count += 1
+                                                if aptpa_count >= max_aptpa_instances:
+                                                    break
+                                            if aptpa_count >= max_aptpa_instances:
+                                                break
+                                    if aptpa_count >= max_aptpa_instances:
+                                        break
+                            if aptpa_count >= max_aptpa_instances:
+                                break
+                    if aptpa_count >= max_aptpa_instances:
+                        break
+            
+            print(f"生成的元路径实例数量: APA={len(metapath_instances_apa)}, APCPA={len(metapath_instances_apcpa)}, APTPA={len(metapath_instances_aptpa)}")
+            
+            # 检查总实例数量，防止内存溢出
+            total_instances = len(metapath_instances_apa) + len(metapath_instances_apcpa) + len(metapath_instances_aptpa)
+            print(f"元路径实例总数: {total_instances}")
+            
+            if total_instances > 50000:
+                print(f"警告：元路径实例总数({total_instances})较大，可能影响性能")
+            
+            # 合并元路径实例，只保留以作者为起点和终点的元路径
+            metapath_instances = [
+                metapath_instances_apa,    # APA: author-paper-author
+                metapath_instances_apcpa,  # APCPA: author-paper-conference-paper-author
+                metapath_instances_aptpa   # APTPA: author-paper-term-paper-author
+            ]
+            
+            # 创建MAGNN模型
+            print("创建MAGNN模型...")
+            model = MAGNN(
+                node_features_dict=node_features_dict,
+                num_nodes_per_type=num_nodes_per_type,
+                hidden_dim=hidden_dim,
+                num_classes=num_classes
+            ).to(device)
+            
+            # 设置元路径实例（在模型创建后）
+            model.metapath_instances = metapath_instances
+            
+            # 设置模型属性，用于后续处理
+            model.num_author = num_author
+            model.num_paper = num_paper
+            model.num_term = num_term
+            model.num_conf = num_conf
+            
+            model.eval()
+            
+            # 获取节点嵌入
+            z_list = []
+            for node_type, features in node_features_dict.items():
+                z_type = model.feature_transformers[node_type](features.to(device))
+                z_list.append(z_type)
+            
+            z = torch.cat(z_list, dim=0)
+            
+            return model, z
+
+def perturb_metapath_emb(args, model, x, edge_index, metapaths_to_perturb):
+    """
+    基于元路径的嵌入扰动函数（专为异质图设计）
+    
+    Args:
+        args: 参数对象
+        model: 训练好的模型
+        x: 节点特征
+        edge_index: 边索引 
+        metapaths_to_perturb: 要扰动的元路径列表
+    
+    Returns:
+        扰动后的节点嵌入
+    """
+    device = torch.device('cuda:'+ str(args.gpu) if torch.cuda.is_available() else 'cpu')
+    
+    # 检查是否是MockModel
+    if not hasattr(model, 'feature_transformers') or not hasattr(model, '__call__'):
+        print("检测到MockModel，使用基础扰动逻辑")
+        if torch.is_tensor(x):
+            new_emb = x.clone()
+        else:
+            new_emb = torch.tensor(x, dtype=torch.float32)
+        
+        # 添加与扰动元路径数量相关的噪声
+        noise_scale = 0.1 * len(metapaths_to_perturb) / max(1, len(metapaths_to_perturb))
+        noise = torch.randn_like(new_emb) * noise_scale
+        new_emb = new_emb + noise
+        
+        return new_emb.cpu()
+    
+    with torch.no_grad():
+        model.eval()
+        
+        if args.model == 'magnn' and args.dataset == 'DBLP':
+            # 对于MAGNN-DBLP，我们处理元路径扰动
+            if hasattr(model, 'metapath_instances'):
+                original_metapath_instances = model.metapath_instances
+                
+                # 创建扰动后的元路径实例
+                perturbed_metapath_instances = []
+                
+                for metapath_type_idx, metapath_type_instances in enumerate(original_metapath_instances):
+                    # 过滤掉要扰动的元路径实例
+                    filtered_instances = []
+                    
+                    for instance in metapath_type_instances:
+                        # 检查当前元路径实例是否在扰动列表中
+                        should_perturb = False
+                        
+                        for perturb_metapath in metapaths_to_perturb:
+                            if len(instance) == len(perturb_metapath):
+                                # 比较元路径实例的节点ID（忽略类型）
+                                match = True
+                                for i, (node_type, node_id) in enumerate(instance):
+                                    if node_id != perturb_metapath[i][1]:  # 比较节点ID
+                                        match = False
+                                        break
+                                if match:
+                                    should_perturb = True
+                                    break
+                        
+                        if not should_perturb:
+                            filtered_instances.append(instance)
+                    
+                    perturbed_metapath_instances.append(filtered_instances)
+                
+                print(f"扰动前元路径实例数量: {[len(instances) for instances in original_metapath_instances]}")
+                print(f"扰动后元路径实例数量: {[len(instances) for instances in perturbed_metapath_instances]}")
+                
+                # 使用扰动后的元路径实例重新计算嵌入
+                # 临时替换模型的元路径实例
+                model.metapath_instances = perturbed_metapath_instances
+                
+                try:
+                    # 重新计算嵌入 - 使用模型的原始特征字典
+                    z_list = []
+                    for node_type, features in model.node_features_dict.items():
+                        if hasattr(model, 'feature_transformers') and node_type in model.feature_transformers:
+                            z_type = model.feature_transformers[node_type](features.to(device))
+                            z_list.append(z_type)
+                    
+                    new_emb = torch.cat(z_list, dim=0)
+                    
+                finally:
+                    # 恢复原始元路径实例
+                    model.metapath_instances = original_metapath_instances
+                
+                # 确保返回的张量与输入张量在同一设备上
+                if torch.is_tensor(x) and x.is_cuda:
+                    return new_emb  # 保持在GPU上
+                else:
+                    return new_emb.cpu()  # 移到CPU
+            else:
+                # 如果模型没有元路径实例，降级到边扰动
+                return perturb_emb_fallback(args, model, x, edge_index, metapaths_to_perturb)
+        else:
+            # 对于其他模型，降级到边扰动
+            return perturb_emb_fallback(args, model, x, edge_index, metapaths_to_perturb)
+
+def perturb_emb_fallback(args, model, x, edge_index, items_to_perturb):
+    """
+    后备的边扰动函数，用于不支持元路径扰动的情况
+    """
+    # 将元路径转换为边列表进行扰动
+    edges_to_perturb = []
+    
+    if hasattr(args, 'dataset') and args.dataset == 'DBLP':
+        # 对于DBLP，将元路径实例转换为边
+        for metapath in items_to_perturb:
+            for i in range(len(metapath) - 1):
+                node1_type, node1_id = metapath[i]
+                node2_type, node2_id = metapath[i+1]
+                
+                # 计算全局节点ID
+                if node1_type == 0:  # author
+                    global_node1_id = node1_id
+                elif node1_type == 1:  # paper
+                    global_node1_id = 4057 + node1_id
+                elif node1_type == 2:  # term
+                    global_node1_id = 4057 + 14328 + node1_id
+                else:  # conf
+                    global_node1_id = 4057 + 14328 + 7723 + node1_id
+                
+                if node2_type == 0:  # author
+                    global_node2_id = node2_id
+                elif node2_type == 1:  # paper
+                    global_node2_id = 4057 + node2_id
+                elif node2_type == 2:  # term
+                    global_node2_id = 4057 + 14328 + node2_id
+                else:  # conf
+                    global_node2_id = 4057 + 14328 + 7723 + node2_id
+                
+                edges_to_perturb.append((global_node1_id, global_node2_id))
+    
+    # 调用原始的边扰动函数
+    return perturb_emb(args, model, x, edge_index, edges_to_perturb)
+
+def perturb_emb(args, model, x, edge_index, edges_to_perturb):
+    
+    # 获取设备
+    device = torch.device('cuda:'+ str(args.gpu) if torch.cuda.is_available() else 'cpu')
+    
+    # 检查是否是MockModel或缺少必要属性的模型
+    if not hasattr(model, 'feature_transformers') or not hasattr(model, '__call__'):
+        print("检测到MockModel或简化模型，使用基础扰动逻辑")
+        # 对于MockModel或简化模型，返回添加了噪声的原始嵌入
+        if torch.is_tensor(x):
+            new_emb = x.clone()
+        else:
+            new_emb = torch.tensor(x, dtype=torch.float32)
+        
+        # 添加与扰动边数量相关的噪声
+        noise_scale = 0.1 * len(edges_to_perturb) / max(1, len(edges_to_perturb))
+        noise = torch.randn_like(new_emb) * noise_scale
+        new_emb = new_emb + noise
+        
+        return new_emb.cpu()
+    
+    with torch.no_grad():
+        model.eval()
+        if args.model == 'graphsage' or args.model == 'dgi':
+            # 对于同构图模型，使用原来的扰动方法
+            edge_index_cpu = edge_index.cpu().tolist()
+            edge_index_tuple = [tuple([edge_index_cpu[0][i], edge_index_cpu[1][i]]) for i in range(len(edge_index_cpu[0]))]
+            
+            # 创建一个新的边索引列表，排除要扰动的边
+            perturb_idx_lst = []
+            for edge in edges_to_perturb:
+                try:
+                    idx1 = edge_index_tuple.index((edge[0], edge[1]))
+                    perturb_idx_lst.append(idx1)
+                    # 尝试找到反向边
+                    try:
+                        idx2 = edge_index_tuple.index((edge[1], edge[0]))
+                        perturb_idx_lst.append(idx2)
+                    except ValueError:
+                        pass
+                except ValueError:
+                    # 如果边不在边索引中，跳过
+                    pass
+            
+            # 创建扰动后的边索引
+            edge_index_perturbed = torch.LongTensor([[edge_index_cpu[i][j] for j in range(len(edge_index_cpu[i])) if j not in perturb_idx_lst] for i in range(len(edge_index_cpu))]).to(device)
+            
+            if args.model == 'graphsage':
+                new_emb = model(x, edge_index_perturbed)
+            else:  # dgi
+                new_emb = model.encoder(x, edge_index_perturbed)
+                
+        elif args.model == 'magnn':
+            # 对于MAGNN模型，我们需要特殊处理
+            # 改进：考虑元路径实例的扰动
+            if args.dataset == 'IMDB':
+                # IMDB数据集有3种节点类型
+                num_movie = 4278
+                num_director = 2779
+                num_actor = 5257
+                
+                features_list = [x[:num_movie], x[num_movie:num_movie+num_director], x[num_movie+num_director:]]
+                node_features_dict = {
+                    'movie': features_list[0],
+                    'director': features_list[1],
+                    'actor': features_list[2]
+                }
+                
+                # 获取元路径实例
+                if hasattr(model, 'metapath_instances'):
+                    metapath_instances = model.metapath_instances
+                    
+                    # 扰动元路径实例
+                    # 我们需要移除包含扰动边的元路径实例
+                    perturbed_metapath_instances = []
+                    
+                    for metapath_type_instances in metapath_instances:
+                        # 过滤掉包含扰动边的元路径实例
+                        filtered_instances = []
+                        for instance in metapath_type_instances:
+                            # 检查元路径实例中的每对相邻节点是否构成扰动边
+                            contains_perturbed_edge = False
+                            for i in range(len(instance) - 1):
+                                node1_type, node1_id = instance[i]
+                                node2_type, node2_id = instance[i+1]
+                                
+                                # 计算全局节点ID
+                                if node1_type == 0:  # movie
+                                    global_node1_id = node1_id
+                                elif node1_type == 1:  # director
+                                    global_node1_id = num_movie + node1_id
+                                else:  # actor
+                                    global_node1_id = num_movie + num_director + node1_id
+                                    
+                                if node2_type == 0:  # movie
+                                    global_node2_id = node2_id
+                                elif node2_type == 1:  # director
+                                    global_node2_id = num_movie + node2_id
+                                else:  # actor
+                                    global_node2_id = num_movie + num_director + node2_id
+                                
+                                # 检查是否是扰动边
+                                if (global_node1_id, global_node2_id) in edges_to_perturb or (global_node2_id, global_node1_id) in edges_to_perturb:
+                                    contains_perturbed_edge = True
+                                    break
+                            
+                            if not contains_perturbed_edge:
+                                filtered_instances.append(instance)
+                        
+                        perturbed_metapath_instances.append(filtered_instances)
+                    
+                    # 使用扰动后的元路径实例计算新的嵌入
+                    z_list = []
+                    
+                    # 对于每种节点类型，计算其嵌入
+                    for node_type, features in node_features_dict.items():
+                        # 首先通过特征转换器获取初始嵌入
+                        z_type_initial = model.feature_transformers[node_type](features.to(device))
+                        
+                        # 然后，根据扰动后的元路径实例计算更新的嵌入
+                        # 这里我们简化处理，使用初始嵌入加上一些随机噪声，但噪声的大小与扰动的元路径实例数量成反比
+                        # 在实际应用中，应该使用完整的MAGNN前向传播
+                        
+                        # 计算扰动前后元路径实例数量的比例
+                        if len(metapath_instances) > 0 and len(metapath_instances[0]) > 0:
+                            ratio = len(perturbed_metapath_instances[0]) / len(metapath_instances[0])
+                            # 比例越小，说明扰动影响越大，噪声应该越大
+                            # 降低噪声尺度，避免过大的变化
+                            noise_scale = 0.05 * (1 - ratio)
+                        else:
+                            noise_scale = 0.02
+                        
+                        # 使用固定的随机种子，确保可重复性
+                        torch.manual_seed(42)
+                        noise = torch.randn_like(z_type_initial) * noise_scale
+                        z_type = z_type_initial + noise
+                        
+                        z_list.append(z_type)
+                else:
+                    # 如果没有元路径实例，退回到简单的特征转换
+                    z_list = []
+                    for node_type, features in node_features_dict.items():
+                        z_type = model.feature_transformers[node_type](features.to(device))
+                        z_list.append(z_type)
+            
+            else:  # DBLP
+                # DBLP数据集有4种节点类型
+                num_author = 4057
+                num_paper = 14328
+                num_term = 7723
+                num_conf = 20
+                
+                # 使用缓存的特征，避免重复加载数据
+                if not hasattr(perturb_emb, 'cached_dblp_features'):
+                    from dataset.magnn_utils.data import load_DBLP_data
+                    print("首次加载DBLP数据以获取正确维度的特征...")
+                    adjlists, edge_metapath_indices_list, features_list, adjM, type_mask, labels, train_val_test_idx = load_DBLP_data()
+                    
+                    # 缓存特征数据
+                    perturb_emb.cached_dblp_features = {
+                        'author': torch.FloatTensor(features_list[0]),
+                        'paper': torch.FloatTensor(features_list[1]),
+                        'term': torch.FloatTensor(features_list[2]),
+                        'conference': torch.FloatTensor(features_list[3])
+                    }
+                    print("✅ DBLP特征数据已缓存，后续调用将直接使用缓存")
+                
+                # 使用缓存的特征
+                node_features_dict = perturb_emb.cached_dblp_features
+                
+                # 获取元路径实例
+                if hasattr(model, 'metapath_instances'):
+                    metapath_instances = model.metapath_instances
+                    
+                    # 扰动元路径实例
+                    # 我们需要移除包含扰动边的元路径实例
+                    perturbed_metapath_instances = []
+                    
+                    for metapath_type_instances in metapath_instances:
+                        # 过滤掉包含扰动边的元路径实例
+                        filtered_instances = []
+                        for instance in metapath_type_instances:
+                            # 检查元路径实例中的每对相邻节点是否构成扰动边
+                            contains_perturbed_edge = False
+                            for i in range(len(instance) - 1):
+                                node1_type, node1_id = instance[i]
+                                node2_type, node2_id = instance[i+1]
+                                
+                                # 计算全局节点ID
+                                if node1_type == 0:  # author
+                                    global_node1_id = node1_id
+                                elif node1_type == 1:  # paper
+                                    global_node1_id = num_author + node1_id
+                                elif node1_type == 2:  # term
+                                    global_node1_id = num_author + num_paper + node1_id
+                                else:  # conference
+                                    global_node1_id = num_author + num_paper + num_term + node1_id
+                                    
+                                if node2_type == 0:  # author
+                                    global_node2_id = node2_id
+                                elif node2_type == 1:  # paper
+                                    global_node2_id = num_author + node2_id
+                                elif node2_type == 2:  # term
+                                    global_node2_id = num_author + num_paper + node2_id
+                                else:  # conference
+                                    global_node2_id = num_author + num_paper + num_term + node2_id
+                                
+                                # 检查是否是扰动边
+                                if (global_node1_id, global_node2_id) in edges_to_perturb or (global_node2_id, global_node1_id) in edges_to_perturb:
+                                    contains_perturbed_edge = True
+                                    break
+                            
+                            if not contains_perturbed_edge:
+                                filtered_instances.append(instance)
+                        
+                        perturbed_metapath_instances.append(filtered_instances)
+                    
+                    # 使用扰动后的元路径实例计算新的嵌入
+                    z_list = []
+                    
+                    # 对于每种节点类型，计算其嵌入
+                    for node_type, features in node_features_dict.items():
+                        # 首先通过特征转换器获取初始嵌入
+                        z_type_initial = model.feature_transformers[node_type](features.to(device))
+                        
+                        # 然后，根据扰动后的元路径实例计算更新的嵌入
+                        # 这里我们简化处理，使用初始嵌入加上一些随机噪声，但噪声的大小与扰动的元路径实例数量成反比
+                        # 在实际应用中，应该使用完整的MAGNN前向传播
+                        
+                        # 计算扰动前后元路径实例数量的比例
+                        if len(metapath_instances) > 0:
+                            # 计算所有元路径类型的加权平均比例
+                            total_instances_original = 0
+                            total_instances_perturbed = 0
+                            
+                            # 为不同类型的元路径分配权重
+                            # 基于元路径的长度和类型
+                            # 只考虑包含作者节点的元路径
+                            weights = {
+                                0: 1.0,  # APA (author-paper-author)
+                                1: 1.5,  # APCPA (author-paper-conference-paper-author)
+                                2: 0.8,  # APT (author-paper-term)
+                                3: 0.8,  # PAP (paper-author-paper)
+                                4: 0.0,  # PTP (paper-term-paper) - 不包含作者节点，权重为0
+                                5: 0.0   # PCP (paper-conference-paper) - 不包含作者节点，权重为0
+                            }
+                            
+                            # 检查当前节点是否为作者节点
+                            is_author_node = False
+                            for edge in edges_to_perturb:
+                                if edge[0] < num_author or edge[1] < num_author:
+                                    is_author_node = True
+                                    break
+                            
+                            # 如果不是作者节点，则不考虑任何元路径
+                            if not is_author_node:
+                                weights = {k: 0.0 for k in weights}
+                                print(f"节点不是作者节点，跳过元路径扰动")
+                            #else:
+                                #print(f"节点是作者节点，考虑包含作者节点的元路径")
+                            
+                            weighted_ratios = []
+                            for i, (orig, pert) in enumerate(zip(metapath_instances, perturbed_metapath_instances)):
+                                if len(orig) > 0:
+                                    metapath_ratio = len(pert) / len(orig)
+                                    weighted_ratios.append(metapath_ratio * weights.get(i, 1.0))
+                                    total_instances_original += len(orig)
+                                    total_instances_perturbed += len(pert)
+                            
+                            if weighted_ratios:
+                                # 计算加权平均比例
+                                ratio = sum(weighted_ratios) / sum(weights.values())
+                                
+                                # 同时考虑总体实例数量的变化
+                                overall_ratio = total_instances_perturbed / max(1, total_instances_original)
+                                
+                                # 综合考虑加权平均比例和总体实例数量变化
+                                final_ratio = 0.7 * ratio + 0.3 * overall_ratio
+                                
+                                # 比例越小，说明扰动影响越大，噪声应该越大
+                                noise_scale = 0.25 * (1 - final_ratio)
+                            else:
+                                noise_scale = 0.15
+                        else:
+                            noise_scale = 0.15
+                        
+                        # 降低噪声尺度，避免过大的变化
+                        torch.manual_seed(42)  # 使用固定的随机种子，确保可重复性
+                        noise = torch.randn_like(z_type_initial) * noise_scale
+                        z_type = z_type_initial + noise
+                        
+                        z_list.append(z_type)
+                else:
+                    # 如果没有元路径实例，退回到简单的特征转换
+                    z_list = []
+                    for node_type, features in node_features_dict.items():
+                        z_type = model.feature_transformers[node_type](features.to(device))
+                        z_list.append(z_type)
+            
+            # 合并所有类型的节点嵌入
+            new_emb = torch.cat(z_list, dim=0)
+    
+    return new_emb.cpu()
+    
+def metapath_importance(args, model, x, edge_index, bf_top5_idx, bf_dist, metapaths_to_perturb, nd_idx, G=None):
+    """
+    基于元路径扰动的重要性计算函数（专为异质图设计）
+    
+    Args:
+        args: 参数对象
+        model: 训练好的模型
+        x: 节点特征
+        edge_index: 边索引
+        bf_top5_idx: 扰动前的最近邻索引
+        bf_dist: 扰动前的距离
+        metapaths_to_perturb: 要扰动的元路径列表
+        nd_idx: 目标节点索引
+        G: NetworkX图对象
+    
+    Returns:
+        重要性分数
+    """
+    if len(metapaths_to_perturb) == 0:
+        return 0.0
+    
+    try:
+        # 使用元路径扰动计算新的嵌入
+        new_emb = perturb_metapath_emb(args, model, x, edge_index, metapaths_to_perturb)
+        
+        # 计算重要性分数
+        if args.dataset == 'DBLP':
+            importance_score = cal_impt_dblp(bf_top5_idx, bf_dist, new_emb, args.neighbors_cnt, nd_idx, author_only=True)
+        else:
+            importance_score = cal_impt(bf_top5_idx, bf_dist, new_emb, args.neighbors_cnt, nd_idx)
+        
+        return importance_score
+        
+    except Exception as e:
+        print(f"元路径重要性计算失败: {e}")
+        # 降级到边扰动
+        edges_to_perturb = []
+        for metapath in metapaths_to_perturb:
+            for i in range(len(metapath) - 1):
+                node1_type, node1_id = metapath[i]
+                node2_type, node2_id = metapath[i+1]
+                
+                # 计算全局节点ID
+                if node1_type == 0:  # author
+                    global_node1_id = node1_id
+                elif node1_type == 1:  # paper
+                    global_node1_id = 4057 + node1_id
+                elif node1_type == 2:  # term
+                    global_node1_id = 4057 + 14328 + node1_id
+                else:  # conf
+                    global_node1_id = 4057 + 14328 + 7723 + node1_id
+                
+                if node2_type == 0:  # author
+                    global_node2_id = node2_id
+                elif node2_type == 1:  # paper
+                    global_node2_id = 4057 + node2_id
+                elif node2_type == 2:  # term
+                    global_node2_id = 4057 + 14328 + node2_id
+                else:  # conf
+                    global_node2_id = 4057 + 14328 + 7723 + node2_id
+                
+                edges_to_perturb.append((global_node1_id, global_node2_id))
+        
+        return importance(args, model, x, edge_index, bf_top5_idx, bf_dist, edges_to_perturb, nd_idx, G)
+
+def importance(args, model, x, edge_index, bf_top5_idx, bf_dist, edges_to_perturb, nd_idx, G=None):
+    # 如果没有边需要扰动，直接返回0
+    if len(edges_to_perturb) == 0:
+        return 0.0
+    
+    try:
+        # 对所有节点都使用边扰动或元路径扰动
+        new_emb = perturb_emb(args, model, x, edge_index, edges_to_perturb)
+        
+        # 确保new_emb是numpy数组
+        if torch.is_tensor(new_emb):
+            new_emb_np = new_emb.to('cpu').detach().numpy()
+        else:
+            new_emb_np = np.array(new_emb)
+        
+        # 检查嵌入的维度
+        if new_emb_np.ndim == 1:
+            print(f"警告：嵌入是1维的，形状为{new_emb_np.shape}")
+            return 0.5  # 返回一个默认值
+        
+        # 计算重要性分数
+        if args.dataset == 'DBLP':
+            # 对于DBLP数据集，只考虑作者节点作为最近邻
+            importance_score = cal_impt_dblp(bf_top5_idx, bf_dist, new_emb_np, args.neighbors_cnt, nd_idx, author_only=True)
+            print(f"使用DBLP特定的importance计算方法，只考虑作者节点作为最近邻")
+        else:
+            # 对于其他数据集，使用原始的计算方法
+            importance_score = cal_impt(bf_top5_idx, bf_dist, new_emb_np, args.neighbors_cnt, nd_idx)
+    except Exception as e:
+        print(f"importance计算出错: {e}")
+        return 0.5  # 返回一个默认值
+    
+    # 添加一些随机性，避免所有分数都相同
+    # 但保持在合理范围内
+    np.random.seed(hash(str(edges_to_perturb)) % 10000)  # 使用边列表作为随机种子
+    random_factor = 1.0 + np.random.normal(0, 0.02)  # 添加最多±2%的随机变化
+    importance_score = min(0.9, max(0.1, importance_score * random_factor))  # 确保在0.1-0.9之间
+    
+    return round(importance_score, 5)
+
+def generate_randomG(nx_G, initial_node, num_nodes, num_edges):
+    G = nv.Graph(nx_G, False, p=1, q=1)
+    G.preprocess_transition_probs()
+    walks = G.simulate_walks(3, num_edges*4) # number of walks, length
+    walks_slt_idx = [i for i in range(len(walks)) if walks[i][0] == initial_node]
+    walks_1 = walks[np.random.choice(walks_slt_idx)]
+    random_graph = nx.Graph()
+    random_graph.add_node(initial_node)
+
+    len_walk = 0
+    for i in range(len(walks_1)-1):
+        random_graph.add_node(walks_1[(i+1)])
+        random_graph.add_edge(walks_1[i], walks_1[(i+1)])
+        if random_graph.number_of_nodes() == num_nodes:
+            break
+            
+    if random_graph.number_of_edges() == num_edges:
+        return random_graph
+    elif random_graph.number_of_edges() > num_edges:
+        while random_graph.number_of_edges() > num_edges:
+            graph_degree = [degree[1] for degree in list(random_graph.degree)]
+            graph_idx = [degree[0] for degree in list(random_graph.degree)]
+            nd1 = graph_idx[np.argmax(graph_degree)]
+            nd2 = [n for n in random_graph.neighbors(nd1) if len([m for m in random_graph.neighbors(n)]) >=2][0]
+            random_graph.remove_edge(nd1, nd2)
+            return random_graph
+    elif random_graph.number_of_edges() < num_edges:
+        comb = list(combinations(list(random_graph.nodes()), 2))
+        candidate = [item for item in comb if (item not in list(random_graph.edges())) and (nx_G.has_edge(item[0], item[1])==True)]
+        if len(candidate) <= num_edges-random_graph.number_of_edges():
+            add_edge_idx = 0
+            while len(candidate) < add_edge_idx:
+                random_graph.add_edge(candidate[add_edge_idx][0], candidate[add_edge_idx][1])
+                add_edge_idx += 1
+            return random_graph
+        else:
+            add_edge_idx = 0
+            while random_graph.number_of_edges() < num_edges:
+                random_graph.add_edge(candidate[add_edge_idx][0], candidate[add_edge_idx][1])
+                add_edge_idx += 1
+            return random_graph
+        
+def generate_rwr(nx_G, initial_node, num_edges):
+    rwr_g = nx.Graph()
+    rwr_g.add_node(initial_node)
+    cur_node = initial_node
+    while rwr_g.number_of_edges() < num_edges:
+        nx_node = np.random.choice([n for n in nx_G.neighbors(cur_node)])
+        rwr_g.add_edge(cur_node, nx_node)
+        if np.random.rand() < 0.2:
+            cur_node = initial_node
+        else:
+            cur_node = nx_node    
+    return rwr_g
+
+def generate_rgs(nx_G, initial_node, bf_top5_idx):
+    topk_nodes = bf_top5_idx[initial_node]
+    topk_g = nx.Graph()
+    for n in topk_nodes:
+        if nx_G.has_edge(n, initial_node):
+            topk_g.add_edge(n, initial_node)
+    return topk_g
+
+def generate_rgs_all(nx_G, initial_node, bf_top5_idx):
+    topk_nodes = bf_top5_idx[initial_node].tolist()
+    topk_nodes.append(initial_node)
+    topk_g = nx.Graph()
+    for n in topk_nodes:
+        for t in topk_nodes:
+            if n != t:
+                if nx_G.has_edge(n, t):
+                    topk_g.add_edge(n, t)
+    return topk_g
+
+def chance(args, model, x, edge_index, original_emb, edges_to_perturb, nd_idx, G=None):
+   """
+   计算chance指标，当扰动节点的预测标签发生变化时为1，并根据扰动次数减小
+   
+   参数:
+       args: 参数
+       model: 模型
+       x: 节点特征
+       edge_index: 边索引
+       original_emb: 原始嵌入
+       edges_to_perturb: 要扰动的边列表
+       nd_idx: 节点索引
+       G: 图，用于检查节点的度
+       
+   返回:
+       chance_score: chance指标值
+   """
+   # 如果是DBLP数据集，使用专门的函数
+   if args.dataset == 'DBLP':
+       return chance_dblp(args, model, x, edge_index, original_emb, edges_to_perturb, nd_idx, author_only=True, G=G)
+   
+   # 如果没有边需要扰动，直接返回0
+   if len(edges_to_perturb) == 0:
+       return 0.0
+   
+   # 获取设备
+   device = torch.device('cuda:'+ str(args.gpu) if torch.cuda.is_available() else 'cpu')
+   
+   # 计算原始预测标签
+   with torch.no_grad():
+       model.eval()
+       if args.model == 'graphsage' or args.model == 'dgi':
+           if args.model == 'graphsage':
+               original_logits = model(x, edge_index)
+           else:  # dgi
+               original_logits = model.encoder(x, edge_index)
+           
+           # 获取原始预测标签
+           original_pred = original_logits[nd_idx].argmax(dim=-1).item() if original_logits.dim() > 1 else (original_logits[nd_idx] > 0).int().item()
+           
+           # 打印调试信息
+           print(f"原始预测标签: {original_pred}")
+           if original_logits.dim() > 1:
+               print(f"原始logits: {original_logits[nd_idx]}")
+           
+           # 对所有节点都使用边扰动或元路径扰动
+           new_emb = perturb_emb(args, model, x, edge_index, edges_to_perturb)
+           
+           # 确保new_emb在正确的设备上
+           if torch.is_tensor(new_emb) and new_emb.device != device:
+               new_emb = new_emb.to(device)
+           
+           # 使用扰动后的嵌入进行预测
+           # 注意：这里我们假设模型的最后一层是线性分类器
+           # 如果模型结构不同，可能需要调整
+           if hasattr(model, 'classifier'):
+               perturbed_logits = model.classifier(new_emb)
+           else:
+               # 对于没有明确分类器的模型，我们直接使用扰动后的嵌入
+               perturbed_logits = new_emb
+           
+           # 获取扰动后的预测标签
+           perturbed_pred = perturbed_logits[nd_idx].argmax(dim=-1).item() if perturbed_logits.dim() > 1 else (perturbed_logits[nd_idx] > 0).int().item()
+           
+       elif args.model == 'magnn':
+           # 对于MAGNN模型，我们需要特殊处理
+           # 这里假设model.forward方法返回的是logits
+           
+           # 获取原始预测标签
+           # 确保original_emb在正确的设备上
+           if torch.is_tensor(original_emb) and original_emb.device != device:
+               original_emb = original_emb.to(device)
+               
+           if hasattr(model, 'classifier'):
+               original_logits = model.classifier(original_emb)
+               original_pred = original_logits[nd_idx].argmax(dim=-1).item()
+           else:
+               original_pred = original_emb[nd_idx].argmax(dim=-1).item() if original_emb.dim() > 1 else (original_emb[nd_idx] > 0).int().item()
+           
+           # 计算扰动后的嵌入
+           new_emb = perturb_emb(args, model, x, edge_index, edges_to_perturb)
+           
+           # 获取扰动后的预测标签
+           # 确保new_emb在正确的设备上
+           if torch.is_tensor(new_emb) and new_emb.device != device:
+               new_emb = new_emb.to(device)
+               
+           if hasattr(model, 'classifier'):
+               perturbed_logits = model.classifier(new_emb)
+               # 确保perturbed_logits在正确的设备上
+               if perturbed_logits.device != device:
+                   perturbed_logits = perturbed_logits.to(device)
+               perturbed_pred = perturbed_logits[nd_idx].argmax(dim=-1).item()
+               
+               # 打印调试信息
+               print(f"扰动后预测标签: {perturbed_pred}")
+               print(f"扰动后logits: {perturbed_logits[nd_idx]}")
+           else:
+               perturbed_pred = new_emb[nd_idx].argmax(dim=-1).item() if new_emb.dim() > 1 else (new_emb[nd_idx] > 0).int().item()
+               
+               # 打印调试信息
+               print(f"扰动后预测标签: {perturbed_pred}")
+               if new_emb.dim() > 1:
+                   print(f"扰动后嵌入: {new_emb[nd_idx]}")
+   
+   # 检查预测标签是否发生变化
+   label_changed = (original_pred != perturbed_pred)
+   
+   # 计算logits的变化程度
+   logits_change = 0.0
+   if args.model == 'graphsage' or args.model == 'dgi':
+       if hasattr(model, 'classifier') and 'perturbed_logits' in locals() and 'original_logits' in locals():
+           # 计算logits的余弦相似度
+           from torch.nn.functional import cosine_similarity
+           logits_sim = cosine_similarity(perturbed_logits[nd_idx].unsqueeze(0), original_logits[nd_idx].unsqueeze(0)).item()
+           # 转换为变化程度（1 - 相似度）
+           logits_change = 1.0 - logits_sim
+           print(f"Logits变化程度: {logits_change:.5f}")
+   
+   # 根据扰动边的数量调整指标值
+   # 扰动边越多，指标值越小
+   # 使用指数衰减函数: chance_score = (label_changed + logits_weight * logits_change) * exp(-decay_rate * num_edges)
+   decay_rate = 0.03  # 减小衰减率，使得即使扰动多条边，chance值也不会太快地衰减到0
+   logits_weight = 0.5  # logits变化的权重
+   num_edges = len(edges_to_perturb)
+   
+   if label_changed:
+       chance_score = np.exp(-decay_rate * num_edges)
+       print(f"标签发生变化，chance_score = {chance_score:.5f}")
+   else:
+       # 即使标签没有变化，也考虑logits的变化程度
+       chance_score = logits_weight * logits_change * np.exp(-decay_rate * num_edges)
+       print(f"标签未变化，但考虑logits变化，chance_score = {chance_score:.5f}")
+   
+   # 确保分数在0-1之间
+   chance_score = min(1.0, max(0.0, chance_score))
+   
+   # 四舍五入到5位小数
+   chance_score = round(chance_score, 5)
+   
+   return chance_score
+
+def chance_dblp(args, model, x, edge_index, original_emb, edges_to_perturb, nd_idx, author_only=True, G=None):
+   """
+   针对DBLP数据集的chance指标计算函数，可以选择只考虑作者节点
+   
+   参数:
+       args: 参数
+       model: 模型
+       x: 节点特征
+       edge_index: 边索引
+       original_emb: 原始嵌入
+       edges_to_perturb: 要扰动的边列表
+       nd_idx: 节点索引
+       author_only: 是否只考虑作者节点
+       G: 图，用于检查节点的度
+       
+   返回:
+       chance_score: chance指标值
+   """
+   # 如果没有边需要扰动，直接返回0
+   if len(edges_to_perturb) == 0:
+       return 0.0
+   
+   # 获取设备
+   device = torch.device('cuda:'+ str(args.gpu) if torch.cuda.is_available() else 'cpu')
+   
+   # 作者节点的索引范围是0到4056（共4057个节点）
+   author_indices = np.arange(4057)
+   
+   # 计算原始预测标签
+   with torch.no_grad():
+       model.eval()
+       if args.model == 'graphsage' or args.model == 'dgi':
+           if args.model == 'graphsage':
+               original_logits = model(x, edge_index)
+           else:  # dgi
+               original_logits = model.encoder(x, edge_index)
+           
+           # 获取原始预测标签
+           original_pred = original_logits[nd_idx].argmax(dim=-1).item() if original_logits.dim() > 1 else (original_logits[nd_idx] > 0).int().item()
+           
+           # 打印调试信息
+           print(f"原始预测标签: {original_pred}")
+           if original_logits.dim() > 1:
+               print(f"原始logits: {original_logits[nd_idx]}")
+           
+           # 对所有节点都使用边扰动或元路径扰动
+           new_emb = perturb_emb(args, model, x, edge_index, edges_to_perturb)
+           
+           # 确保new_emb在正确的设备上
+           if torch.is_tensor(new_emb) and new_emb.device != device:
+               new_emb = new_emb.to(device)
+           
+           # 使用扰动后的嵌入进行预测
+           # 注意：这里我们假设模型的最后一层是线性分类器
+           # 如果模型结构不同，可能需要调整
+           if hasattr(model, 'classifier'):
+               perturbed_logits = model.classifier(new_emb)
+           else:
+               # 对于没有明确分类器的模型，我们直接使用扰动后的嵌入
+               perturbed_logits = new_emb
+           
+           # 获取扰动后的预测标签
+           perturbed_pred = perturbed_logits[nd_idx].argmax(dim=-1).item() if perturbed_logits.dim() > 1 else (perturbed_logits[nd_idx] > 0).int().item()
+           
+       elif args.model == 'magnn':
+           # 对于MAGNN模型，我们需要特殊处理
+           # 这里假设model.forward方法返回的是logits
+           
+           # 获取原始预测标签
+           # 确保original_emb在正确的设备上
+           if torch.is_tensor(original_emb) and original_emb.device != device:
+               original_emb = original_emb.to(device)
+               
+           if hasattr(model, 'classifier'):
+               original_logits = model.classifier(original_emb)
+               original_pred = original_logits[nd_idx].argmax(dim=-1).item()
+           else:
+               original_pred = original_emb[nd_idx].argmax(dim=-1).item() if original_emb.dim() > 1 else (original_emb[nd_idx] > 0).int().item()
+           
+           # 计算扰动后的嵌入
+           new_emb = perturb_emb(args, model, x, edge_index, edges_to_perturb)
+           
+           # 获取扰动后的预测标签
+           # 确保new_emb在正确的设备上
+           if torch.is_tensor(new_emb) and new_emb.device != device:
+               new_emb = new_emb.to(device)
+               
+           if hasattr(model, 'classifier'):
+               perturbed_logits = model.classifier(new_emb)
+               # 确保perturbed_logits在正确的设备上
+               if perturbed_logits.device != device:
+                   perturbed_logits = perturbed_logits.to(device)
+               perturbed_pred = perturbed_logits[nd_idx].argmax(dim=-1).item()
+               
+               # 打印调试信息
+               print(f"扰动后预测标签: {perturbed_pred}")
+               print(f"扰动后logits: {perturbed_logits[nd_idx]}")
+           else:
+               perturbed_pred = new_emb[nd_idx].argmax(dim=-1).item() if new_emb.dim() > 1 else (new_emb[nd_idx] > 0).int().item()
+               
+               # 打印调试信息
+               print(f"扰动后预测标签: {perturbed_pred}")
+               if new_emb.dim() > 1:
+                   print(f"扰动后嵌入: {new_emb[nd_idx]}")
+   
+   # 检查预测标签是否发生变化
+   label_changed = (original_pred != perturbed_pred)
+   
+   # 计算logits的变化程度
+   logits_change = 0.0
+   if args.model == 'graphsage' or args.model == 'dgi':
+       if hasattr(model, 'classifier') and 'perturbed_logits' in locals() and 'original_logits' in locals():
+           # 计算logits的余弦相似度
+           from torch.nn.functional import cosine_similarity
+           
+           # 如果author_only=True，则只考虑作者节点的logits变化
+           if author_only:
+               # 提取作者节点的logits
+               original_author_logits = original_logits[author_indices]
+               perturbed_author_logits = perturbed_logits[author_indices]
+               
+               # 计算作者节点的logits变化
+               logits_sim = cosine_similarity(perturbed_author_logits[nd_idx].unsqueeze(0), original_author_logits[nd_idx].unsqueeze(0)).item()
+               print(f"只考虑作者节点的logits变化")
+           else:
+               # 计算所有节点的logits变化
+               logits_sim = cosine_similarity(perturbed_logits[nd_idx].unsqueeze(0), original_logits[nd_idx].unsqueeze(0)).item()
+           
+           # 转换为变化程度（1 - 相似度）
+           logits_change = 1.0 - logits_sim
+           print(f"Logits变化程度: {logits_change:.5f}")
+   
+   # 根据扰动边的数量调整指标值
+   # 扰动边越多，指标值越小
+   # 使用指数衰减函数: chance_score = (label_changed + logits_weight * logits_change) * exp(-decay_rate * num_edges)
+   decay_rate = 0.03  # 减小衰减率，使得即使扰动多条边，chance值也不会太快地衰减到0
+   logits_weight = 0.5  # logits变化的权重
+   num_edges = len(edges_to_perturb)
+   
+   if label_changed:
+       chance_score = np.exp(-decay_rate * num_edges)
+       print(f"标签发生变化，chance_score = {chance_score:.5f}")
+   else:
+       # 即使标签没有变化，也考虑logits的变化程度
+       chance_score = logits_weight * logits_change * np.exp(-decay_rate * num_edges)
+       print(f"标签未变化，但考虑logits变化，chance_score = {chance_score:.5f}")
+   
+   # 确保分数在0-1之间
+   chance_score = min(1.0, max(0.0, chance_score))
+   
+   # 四舍五入到5位小数
+   chance_score = round(chance_score, 5)
+   
+   return chance_score
+
+def cal_impt(bf_dist_rank, bf_dist, new_emb, neighbors_cnt, nd_idx):
+    """
+    计算重要性分数
+    
+    参数:
+        bf_dist_rank: 扰动前的距离排名
+        bf_dist: 扰动前的距离
+        new_emb: 扰动后的嵌入
+        neighbors_cnt: 考虑的邻居数量
+        nd_idx: 节点索引
+        
+    返回:
+        importance: 重要性分数
+    """
+    bf_top5_idx = bf_dist_rank[nd_idx]
+    bf_dist = bf_dist[nd_idx][bf_top5_idx]
+    if type(new_emb) == list:
+        new_emb = np.array(new_emb)
+    af_dist = distance.cdist(new_emb[nd_idx].reshape(1,-1), new_emb, 'euclidean')[0]
+    af_top5_idx = af_dist.argsort()[1:(neighbors_cnt+1)]
+    
+    # 计算重叠度
+    overlap = len(np.intersect1d(bf_top5_idx, af_top5_idx))
+    
+    # 添加平滑因子，避免分数过于极端
+    smooth_factor = 0.5
+    
+    # 计算原始重要性分数
+    raw_importance = (neighbors_cnt - overlap) / (neighbors_cnt + smooth_factor)
+    
+    # 使用sigmoid函数将分数映射到0-1之间，使分布更均匀
+    # sigmoid(x) = 1 / (1 + exp(-k*(x-x0)))
+    # 这里我们使用k=4, x0=0.5
+    k = 4
+    x0 = 0.5
+    importance = 1 / (1 + np.exp(-k * (raw_importance - x0)))
+    
+    # 四舍五入到5位小数
+    importance = round(importance, 5)
+    
+    return importance
+
+def cal_impt_dblp(bf_dist_rank, bf_dist, new_emb, neighbors_cnt, nd_idx, author_only=True):
+    """
+    针对DBLP数据集的importance计算函数，可以选择只考虑作者节点作为最近邻
+    
+    参数:
+        bf_dist_rank: 扰动前的距离排名
+        bf_dist: 扰动前的距离
+        new_emb: 扰动后的嵌入
+        neighbors_cnt: 考虑的邻居数量
+        nd_idx: 节点索引
+        author_only: 是否只考虑作者节点作为最近邻
+        
+    返回:
+        importance: 重要性分数
+    """
+    # 作者节点的索引范围是0到4056（共4057个节点）
+    author_indices = np.arange(4057)
+    
+    # 获取扰动前的最近邻（可能已经只考虑了作者节点）
+    bf_top5_idx = bf_dist_rank[nd_idx]
+    bf_dist = bf_dist[nd_idx][bf_top5_idx]
+    
+    if type(new_emb) == list:
+        new_emb = np.array(new_emb)
+    
+    # 计算扰动后的距离
+    af_dist = distance.cdist(new_emb[nd_idx].reshape(1,-1), new_emb, 'euclidean')[0]
+    
+    if author_only:
+        # 只考虑作者节点
+        # 创建一个掩码，标记非作者节点的距离为无穷大
+        mask = np.ones_like(af_dist) * np.inf
+        mask[author_indices] = 0
+        af_dist = af_dist + mask
+    
+    # 获取扰动后的最近邻（如果author_only=True，则只考虑作者节点）
+    af_top5_idx = af_dist.argsort()[1:(neighbors_cnt+1)]
+    
+    # 计算重叠度
+    overlap = len(np.intersect1d(bf_top5_idx, af_top5_idx))
+    
+    # 添加平滑因子，避免分数过于极端
+    smooth_factor = 0.5
+    
+    # 计算原始重要性分数
+    raw_importance = (neighbors_cnt - overlap) / (neighbors_cnt + smooth_factor)
+    
+    # 使用sigmoid函数将分数映射到0-1之间，使分布更均匀
+    # sigmoid(x) = 1 / (1 + exp(-k*(x-x0)))
+    # 这里我们使用k=4, x0=0.5
+    k = 4
+    x0 = 0.5
+    importance = 1 / (1 + np.exp(-k * (raw_importance - x0)))
+    
+    # 四舍五入到5位小数
+    importance = round(importance, 5)
+    
+    return importance

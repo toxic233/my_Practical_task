@@ -1,0 +1,6 @@
+INFO:main:初始化ModelManager，使用设备: cuda
+INFO:     Started server process [3079]
+INFO:     Waiting for application startup.
+INFO:main:FastAPI应用启动
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
