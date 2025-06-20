@@ -351,12 +351,6 @@ GET /
 
 本项目采用 [MIT License](LICENSE) 开源协议。
 
-## 📞 联系方式
-
-- **邮箱**: your-email@example.com
-- **项目主页**: https://github.com/your-username/counterfactual-heterogeneous-gnn
-- **论文**: [预印本链接]
-
 ---
 
 如果这个项目对您有帮助，请给我们一个 ⭐ Star！ 
